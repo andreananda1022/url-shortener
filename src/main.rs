@@ -1,11 +1,16 @@
-use axum::{Router, extract::State, routing::{get, post}, Json};
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    http::StatusCode,
+    response::Redirect,
+    routing::{get, post},
+};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::PgPoolOptions;
+use sqlx::{postgres::PgPoolOptions};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use uuid::Uuid;
-use axum::http::StatusCode;
 
 #[derive(Clone)]
 struct AppState {
@@ -81,6 +86,45 @@ async fn create_short_url(
     Err(StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+async fn redirect_url(
+    State(state): State<Arc<AppState>>,
+    Path(short_code): Path<String>,
+) -> Result<(StatusCode, Redirect), StatusCode> {
+    let cached: Option<String> = state.redis_client.clone().get(&short_code).await.unwrap();
+    match cached {
+        Some(uri) => {
+            return Ok((StatusCode::FOUND, Redirect::to(&uri)));
+        }
+        None => {
+            let result = sqlx::query!(
+                "SELECT original_url FROM urls WHERE short_code = $1",
+                short_code
+            )
+            .fetch_optional(&state.db_pool)
+            .await
+            .unwrap();
+
+            match result {
+                Some(row) => {
+                    let redis_client_clone = state.redis_client.clone();
+                    let short_code_clone = short_code.clone();
+                    let original_url_clone = row.original_url.clone();
+
+                    tokio::spawn(async move {
+                        let _: Result<(), _> = redis_client_clone
+                            .clone()
+                            .set(short_code_clone, original_url_clone)
+                            .await;
+                    });
+
+                    Ok((StatusCode::FOUND, Redirect::to(&row.original_url)))
+                }
+                None => Err(StatusCode::NOT_FOUND),
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
@@ -107,6 +151,7 @@ async fn main() {
         .route("/health", get(health_check))
         .route("/redis-check", get(redis_check))
         .route("/shorten", post(create_short_url))
+        .route("/{short_code}", get(redirect_url))
         .with_state(app_state);
 
     let listener = TcpListener::bind("127.0.0.1:8080").await.unwrap();
