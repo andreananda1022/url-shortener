@@ -3,11 +3,11 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::Redirect,
-    routing::{get, post},
+    routing::{get, post, patch},
 };
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
-use sqlx::{postgres::PgPoolOptions};
+use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use uuid::Uuid;
@@ -26,6 +26,11 @@ struct ShortenRequest {
 #[derive(Serialize)]
 struct ShortenResponse {
     short_code: String,
+}
+
+#[derive(Deserialize)]
+struct UpdateUrlRequest {
+    original_url: String,
 }
 
 async fn root_handler() -> &'static str {
@@ -125,6 +130,28 @@ async fn redirect_url(
     }
 }
 
+async fn update_url(
+    State(state): State<Arc<AppState>>,
+    Path(short_code): Path<String>,
+    Json(payload): Json<UpdateUrlRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let result = sqlx::query!(
+        "UPDATE urls SET original_url = $1 WHERE short_code = $2",
+        payload.original_url,
+        short_code
+    )
+    .execute(&state.db_pool)
+    .await
+    .unwrap();
+
+    if result.rows_affected() == 0 {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let _: () = state.redis_client.clone().del(&short_code).await.unwrap();
+    Ok(StatusCode::OK)
+}
+
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
@@ -152,6 +179,7 @@ async fn main() {
         .route("/redis-check", get(redis_check))
         .route("/shorten", post(create_short_url))
         .route("/{short_code}", get(redirect_url))
+        .route("/{short_code}", patch(update_url))
         .with_state(app_state);
 
     let listener = TcpListener::bind("127.0.0.1:8080").await.unwrap();
