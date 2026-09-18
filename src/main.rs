@@ -3,7 +3,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::Redirect,
-    routing::{get, post, patch},
+    routing::{get, patch, post},
 };
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,18 @@ struct ShortenResponse {
 #[derive(Deserialize)]
 struct UpdateUrlRequest {
     original_url: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Claims {
+    sub: String,
+    exp: usize,
+}
+
+#[derive(Deserialize)]
+struct RegisterRequest {
+    username: String,
+    password: String,
 }
 
 async fn root_handler() -> &'static str {
@@ -152,6 +164,32 @@ async fn update_url(
     Ok(StatusCode::OK)
 }
 
+async fn register_user(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<RegisterRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let hashed_password = bcrypt::hash(payload.password, bcrypt::DEFAULT_COST).unwrap();
+    let result = sqlx::query!(
+        "INSERT INTO users (username, password_hash) VALUES ($1, $2)",
+        payload.username,
+        hashed_password
+    )
+    .execute(&state.db_pool)
+    .await;
+
+    match result {
+        Ok(_) => Ok(StatusCode::CREATED),
+        Err(e) => {
+            if let Some(db_err) = e.as_database_error() {
+                if db_err.is_unique_violation() {
+                    return Err(StatusCode::CONFLICT);
+                }
+            }
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
@@ -180,6 +218,7 @@ async fn main() {
         .route("/shorten", post(create_short_url))
         .route("/{short_code}", get(redirect_url))
         .route("/{short_code}", patch(update_url))
+        .route("/register", post(register_user))
         .with_state(app_state);
 
     let listener = TcpListener::bind("127.0.0.1:8080").await.unwrap();
