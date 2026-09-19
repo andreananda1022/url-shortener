@@ -45,6 +45,17 @@ struct RegisterRequest {
     password: String,
 }
 
+#[derive(Deserialize)]
+struct LoginRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(Serialize)]
+struct LoginResponse {
+    token: String,
+}
+
 async fn root_handler() -> &'static str {
     "Hello, URL Shortener!"
 }
@@ -190,6 +201,46 @@ async fn register_user(
     }
 }
 
+fn generate_jwt(user_id: &str) -> String {
+    let secret_key = std::env::var("JWT_SECRET").expect("JWT_SECRET harus di-set di .env");
+    let expiration = chrono::Utc::now()
+        .checked_add_signed(chrono::Duration::hours(24))
+        .expect("gagal menghitung waktu kadaluarsa")
+        .timestamp() as usize;
+    let claims = Claims {
+        sub: user_id.to_owned(),
+        exp: expiration,
+    };
+    let encoding_key = jsonwebtoken::EncodingKey::from_secret(secret_key.as_bytes());
+    let header = jsonwebtoken::Header::default();
+    jsonwebtoken::encode(&header, &claims, &encoding_key).unwrap()
+}
+
+async fn login_user(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<LoginRequest>,
+) -> Result<Json<LoginResponse>, StatusCode> {
+    let user = sqlx::query!(
+        "SELECT id, password_hash FROM users WHERE username = $1",
+        payload.username
+    )
+    .fetch_optional(&state.db_pool)
+    .await
+    .unwrap();
+
+    match user {
+        Some(row) => {
+            let result = bcrypt::verify(payload.password, &row.password_hash).unwrap();
+            if result {
+                let token = generate_jwt(&row.id.to_string());
+                return Ok(Json(LoginResponse { token }));
+            }
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        None => return Err(StatusCode::UNAUTHORIZED),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
@@ -219,6 +270,7 @@ async fn main() {
         .route("/{short_code}", get(redirect_url))
         .route("/{short_code}", patch(update_url))
         .route("/register", post(register_user))
+        .route("/login", post(login_user))
         .with_state(app_state);
 
     let listener = TcpListener::bind("127.0.0.1:8080").await.unwrap();
