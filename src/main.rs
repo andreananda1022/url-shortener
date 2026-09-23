@@ -13,6 +13,9 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
+const RATE_LIMIT_MAX_REQUESTS: i64 = 10;
+const RATE_LIMIT_WINDOW_SECONDS: i64 = 60;
+
 #[derive(Clone)]
 struct AppState {
     db_pool: sqlx::PgPool,
@@ -95,6 +98,32 @@ where
     }
 }
 
+struct RateLimit {
+    user_id: String,
+}
+
+impl FromRequestParts<Arc<AppState>> for RateLimit {
+    type Rejection = StatusCode;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        let auth_user = AuthenticatedUser::from_request_parts(parts, state).await?;
+        let key = format!("rate_limit:{}", auth_user.user_id);
+        let count: i64 = state.redis_client.clone().incr(&key, 1).await.unwrap();
+        if count == 1 {
+            let _: () = state.redis_client.clone().expire(&key, RATE_LIMIT_WINDOW_SECONDS).await.unwrap();
+        }
+        
+        if count > RATE_LIMIT_MAX_REQUESTS {
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+        
+        Ok(RateLimit { user_id: auth_user.user_id })
+    }
+}
+
 async fn root_handler() -> &'static str {
     "Hello, URL Shortener!"
 }
@@ -115,11 +144,11 @@ async fn redis_check(State(state): State<Arc<AppState>>) -> String {
 
 async fn create_short_url(
     State(state): State<Arc<AppState>>,
-    auth_user: AuthenticatedUser,
+    rate_limit: RateLimit,
     Json(payload): Json<ShortenRequest>,
 ) -> Result<Json<ShortenResponse>, StatusCode> {
     let max_retries = 5;
-    let user_id = Uuid::parse_str(&auth_user.user_id).unwrap();
+    let user_id = Uuid::parse_str(&rate_limit.user_id).unwrap();
 
     for _ in 0..max_retries {
         let candidate = nanoid::nanoid!(7);
