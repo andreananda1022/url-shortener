@@ -1,10 +1,11 @@
 use axum::{
     Json, Router,
-    extract::{Path, State},
-    http::StatusCode,
+    extract::{FromRequestParts, Path, State},
+    http::{StatusCode, request::Parts},
     response::Redirect,
     routing::{get, patch, post},
 };
+use jsonwebtoken::Validation;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
@@ -56,6 +57,44 @@ struct LoginResponse {
     token: String,
 }
 
+struct AuthenticatedUser {
+    user_id: String,
+}
+
+impl<S> FromRequestParts<S> for AuthenticatedUser
+where
+    S: Send + Sync,
+{
+    type Rejection = StatusCode;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let header_parts = parts.headers.get("Authorization");
+        match header_parts {
+            Some(header_value) => {
+                let header_str = header_value.to_str().unwrap_or("");
+                let token = match header_str.strip_prefix("Bearer ") {
+                    Some(t) => t,
+                    None => return Err(StatusCode::UNAUTHORIZED),
+                };
+                let secret_key =
+                    std::env::var("JWT_SECRET").expect("JWT_SECRET harus di-set di .env");
+                let decoding_key = jsonwebtoken::DecodingKey::from_secret(secret_key.as_bytes());
+                let result =
+                    jsonwebtoken::decode::<Claims>(token, &decoding_key, &Validation::default());
+                match result {
+                    Ok(token_data) => {
+                        return Ok(AuthenticatedUser {
+                            user_id: token_data.claims.sub,
+                        });
+                    }
+                    Err(_) => Err(StatusCode::UNAUTHORIZED),
+                }
+            }
+            None => return Err(StatusCode::UNAUTHORIZED),
+        }
+    }
+}
+
 async fn root_handler() -> &'static str {
     "Hello, URL Shortener!"
 }
@@ -76,10 +115,11 @@ async fn redis_check(State(state): State<Arc<AppState>>) -> String {
 
 async fn create_short_url(
     State(state): State<Arc<AppState>>,
+    auth_user: AuthenticatedUser,
     Json(payload): Json<ShortenRequest>,
 ) -> Result<Json<ShortenResponse>, StatusCode> {
     let max_retries = 5;
-    let user_id = Uuid::parse_str("1b85a488-2579-4fd1-937c-b87e7cd95f15").unwrap();
+    let user_id = Uuid::parse_str(&auth_user.user_id).unwrap();
 
     for _ in 0..max_retries {
         let candidate = nanoid::nanoid!(7);
