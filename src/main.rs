@@ -1,7 +1,7 @@
 use axum::{
     Json, Router,
-    extract::{FromRequestParts, Path, State},
-    http::{StatusCode, request::Parts},
+    extract::{ConnectInfo, FromRequestParts, Path, State},
+    http::{HeaderMap, StatusCode, request::Parts},
     response::Redirect,
     routing::{get, patch, post},
 };
@@ -9,6 +9,7 @@ use jsonwebtoken::Validation;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use uuid::Uuid;
@@ -113,15 +114,30 @@ impl FromRequestParts<Arc<AppState>> for RateLimit {
         let key = format!("rate_limit:{}", auth_user.user_id);
         let count: i64 = state.redis_client.clone().incr(&key, 1).await.unwrap();
         if count == 1 {
-            let _: () = state.redis_client.clone().expire(&key, RATE_LIMIT_WINDOW_SECONDS).await.unwrap();
+            let _: () = state
+                .redis_client
+                .clone()
+                .expire(&key, RATE_LIMIT_WINDOW_SECONDS)
+                .await
+                .unwrap();
         }
-        
+
         if count > RATE_LIMIT_MAX_REQUESTS {
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
-        
-        Ok(RateLimit { user_id: auth_user.user_id })
+
+        Ok(RateLimit {
+            user_id: auth_user.user_id,
+        })
     }
+}
+
+#[derive(Serialize, Deserialize)]
+struct ClickEvent {
+    short_code: String,
+    user_agent: String,
+    ip_address: String,
+    clicked_at: chrono::DateTime<chrono::Utc>,
 }
 
 async fn root_handler() -> &'static str {
@@ -186,7 +202,30 @@ async fn create_short_url(
 async fn redirect_url(
     State(state): State<Arc<AppState>>,
     Path(short_code): Path<String>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Result<(StatusCode, Redirect), StatusCode> {
+    let click_event = ClickEvent {
+        short_code: short_code.clone(),
+        user_agent: headers
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string(),
+        ip_address: addr.to_string(),
+        clicked_at: chrono::Utc::now(),
+    };
+
+    let redis_client_clone = state.redis_client.clone();
+    tokio::spawn(async move {
+        if let Ok(json_str) = serde_json::to_string(&click_event) {
+            let _: Result<i64, _> = redis_client_clone
+                .clone()
+                .rpush("click_events", json_str)
+                .await;
+        }
+    });
+
     let cached: Option<String> = state.redis_client.clone().get(&short_code).await.unwrap();
     match cached {
         Some(uri) => {
@@ -343,5 +382,10 @@ async fn main() {
         .with_state(app_state);
 
     let listener = TcpListener::bind("127.0.0.1:8080").await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }
