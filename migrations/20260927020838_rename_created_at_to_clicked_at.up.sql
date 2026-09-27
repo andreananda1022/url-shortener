@@ -1,0 +1,1 @@
+ALTER TABLE clicks RENAME COLUMN created_at TO clicked_at;

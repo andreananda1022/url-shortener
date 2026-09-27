@@ -140,6 +140,64 @@ struct ClickEvent {
     clicked_at: chrono::DateTime<chrono::Utc>,
 }
 
+async fn run_analytics_worker(state: Arc<AppState>) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        let items: Vec<String> = state
+            .redis_client
+            .clone()
+            .lrange("click_events", 0, -1)
+            .await
+            .unwrap();
+
+        if items.is_empty() {
+            continue;
+        }
+
+        let click_events: Vec<ClickEvent> = items
+            .iter()
+            .filter_map(|item| serde_json::from_str(item).ok())
+            .collect();
+        let mut short_codes = Vec::new();
+        let mut user_agents = Vec::new();
+        let mut ip_addresses = Vec::new();
+        let mut clicked_ats = Vec::new();
+
+        for event in &click_events {
+            short_codes.push(event.short_code.clone());
+            user_agents.push(event.user_agent.clone());
+            ip_addresses.push(event.ip_address.clone());
+            clicked_ats.push(event.clicked_at);
+        }
+
+        let result = sqlx::query!(
+            r#"
+            INSERT INTO clicks (short_code, user_agent, ip_address, clicked_at)
+            SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::timestamptz[])
+            "#,
+            &short_codes,
+            &user_agents,
+            &ip_addresses,
+            &clicked_ats
+        )
+        .execute(&state.db_pool)
+        .await;
+
+        match result {
+            Ok(_) => {
+                let processed_count = items.len();
+                let _: () = state
+                    .redis_client
+                    .clone()
+                    .ltrim("click_events", processed_count as isize, -1)
+                    .await
+                    .unwrap();
+            }
+            Err(e) => eprintln!("Gagal insert batch analytics: {:?}", e)
+        }
+    }
+}
+
 async fn root_handler() -> &'static str {
     "Hello, URL Shortener!"
 }
@@ -369,6 +427,9 @@ async fn main() {
         db_pool: pool,
         redis_client: connection_manager,
     });
+
+    let worker_state = app_state.clone();
+    tokio::spawn(run_analytics_worker(worker_state));
 
     let app = Router::new()
         .route("/", get(root_handler))
