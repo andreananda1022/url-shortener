@@ -224,8 +224,8 @@ Being upfront about what this project does *not* do yet:
 
 ## License
 
-MIT (or your license of choice)
+This project is licensed under the MIT License.
 
 ## Author
 
-Your Name · [GitHub](https://github.com/your-username) · [LinkedIn](https://www.linkedin.com/in/your-profile)
+Andre · [GitHub](https://github.com/andreananda1022)
